@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Static contents distribution using S3 and CloudFront.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Custom domain configuration parameters.
+        Parameters:
+          - CanonicalName
+          - AcmIdentifier
+
+Parameters:
+  CanonicalName:
+    Description: Your Domain Name (CNAME).
+    Type: String
+    AllowedPattern: .+
+    ConstraintDescription: Provide the CNAME (www.example.com).
+  AcmIdentifier:
+    Description: Identifier of the ACM certificate
+    Type: String
+    AllowedPattern: .+
+    ConstraintDescription: Provide the identifier of ACM certificate (us-east-1 only).
+  CachePolicy:
+    Description: Change this if you want to specify a cache policy.
+    Type: String
+    Default: CachingOptimized
+    AllowedValues:
+      - CachingOptimized
+      - CachingDisabled
+      - CachingOptimizedForUncompressedObjects
+      - Elemental-MediaPackage
+      - Amplify
+
+Mappings: 
+  CachePolicyIds:
+    CachingOptimized:
+      Id: 658327ea-f89d-4fab-a63d-7e88639e58f6
+    CachingDisabled:
+      Id: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+    CachingOptimizedForUncompressedObjects:
+      Id: b2884449-e4de-46a7-ac36-70bc7f1ddd6d
+    Elemental-MediaPackage:
+      Id: 08627262-05a9-4f76-9ded-b50ca2e3a84f
+    Amplify:
+      Id: 2e54312d-136d-493c-8eb9-b001f22f67d2
+
+Resources:
+  # S3 bucket contains static contents
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault: 
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration: 
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: origin/
+
+  # S3 bucket policy to allow access from CloudFront OAC
+  AssetsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AssetsBucket
+      PolicyDocument:
+        Statement:
+        - Action: s3:GetObject
+          Effect: Allow
+          Resource: !Sub ${AssetsBucket.Arn}/*
+          Principal:
+            Service: cloudfront.amazonaws.com
+          Condition:
+            StringEquals:
+              AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${AssetsDistribution}
+        - Effect: Deny
+          Principal: '*'
+          Action: 's3:*'
+          Resource: 
+            - !Sub ${AssetsBucket.Arn}/*
+            - !GetAtt AssetsBucket.Arn
+          Condition:
+            Bool: 
+              aws:SecureTransport: false
+  
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AccessControl: LogDeliveryWrite
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault: 
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: Retain2yrs
+            Status: Enabled
+            ExpirationInDays: 730
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+      PublicAccessBlockConfiguration: 
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: 
+              - !Sub ${AccessLogBucket.Arn}/*
+              - !GetAtt AccessLogBucket.Arn
+            Condition:
+              Bool: 
+                aws:SecureTransport: false
+
+  # CloudFront Distribution for contents delivery
+  AssetsDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+        - Id: S3Origin
+          DomainName: !GetAtt AssetsBucket.DomainName
+          S3OriginConfig:
+            OriginAccessIdentity: ''
+          OriginAccessControlId: !GetAtt CloudFrontOriginAccessControl.Id
+        Enabled: true
+        DefaultRootObject: index.html
+        Comment: !Sub ${AWS::StackName} distribution
+        DefaultCacheBehavior:
+          CachePolicyId: !FindInMap [ CachePolicyIds, !Ref CachePolicy , Id ]
+          TargetOriginId: S3Origin
+          FunctionAssociations:
+          - EventType: viewer-request
+            FunctionARN: !ImportValue CloudFrontFunction-IpWhiteList:ARN
+          ViewerProtocolPolicy: redirect-to-https
+        HttpVersion: http2
+        ViewerCertificate:
+          AcmCertificateArn: !Sub arn:aws:acm:us-east-1:${AWS::AccountId}:certificate/${AcmIdentifier}
+          MinimumProtocolVersion: TLSv1.2_2019
+          SslSupportMethod: sni-only
+        Aliases:
+        - !Ref CanonicalName
+        IPV6Enabled: false
+        Logging:
+          Bucket: !GetAtt AccessLogBucket.DomainName
+          IncludeCookies: false
+          Prefix: cloudfront/
+
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties: 
+      OriginAccessControlConfig:
+        Description: Default Origin Access Control
+        Name: !Ref AWS::StackName
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  StaticSiteDeployPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for CI/CD bot user
+      ManagedPolicyName: !Join [ "-", [ !Ref AWS::StackName, "policy"] ]
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:ListBucket
+              - cloudfront:CreateInvalidation
+            Resource:
+              - !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${AssetsDistribution}
+              - !Sub ${AssetsBucket.Arn}/*
+              - !GetAtt AssetsBucket.Arn
+
+Outputs:
+  URL:
+    Value: !Join [ "", [ "https://", !GetAtt AssetsDistribution.DomainName ]]
