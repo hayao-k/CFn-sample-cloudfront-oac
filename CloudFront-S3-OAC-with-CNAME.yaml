@@ -146,9 +146,6 @@ Resources:
         DefaultCacheBehavior:
           CachePolicyId: !FindInMap [ CachePolicyIds, !Ref CachePolicy , Id ]
           TargetOriginId: S3Origin
-          FunctionAssociations:
-          - EventType: viewer-request
-            FunctionARN: !ImportValue CloudFrontFunction-IpWhiteList:ARN
           ViewerProtocolPolicy: redirect-to-https
         HttpVersion: http2
         ViewerCertificate:
